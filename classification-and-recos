@@ -1,0 +1,1401 @@
+# q1a
+
+# bash command to produce tree structure:
+hadoop fs -lsr /data/msd/ | awk '{print $8}' | \sed -e 's/[^-][^\/]*\//--/g' -e 's/^/ /' -e 's/-/|/'
+
+|---audio
+ |-----attributes
+ |-------msd-jmir-area-of-moments-all-v1.0.attributes.csv 
+ |-------msd-jmir-lpc-all-v1.0.attributes.csv
+ ...
+ |-------msd-tssd-v1.0.attributes.csv
+ |-----features
+ |-------msd-jmir-area-of-moments-all-v1.0.csv
+ |---------part-00000.csv.gz
+ |---------part-00001.csv.gz
+ ...
+ |---------part-00007.csv.gz
+ |-------msd-jmir-lpc-all-v1.0.csv
+ |---------part-00000.csv.gz
+ |---------part-00001.csv.gz
+ |---------part-00002.csv.gz
+ ...
+ 
+ |-----statistics
+ |-------sample_properties.csv.gz
+ |---genre
+ |-----msd-MAGD-genreAssignment.tsv
+ |-----msd-MASD-styleAssignment.tsv
+ |-----msd-topMAGD-genreAssignment.tsv
+ |---main
+ |-----summary
+ |-------analysis.csv.gz
+ |-------metadata.csv.gz
+ |---tasteprofile
+ |-----mismatches
+ |-------sid_matches_manually_accepted.txt
+ |-------sid_mismatches.txt
+ |-----triplets.tsv
+ |-------part-00000.tsv.gz
+ |-------part-00001.tsv.gz
+ ...
+
+
+
+#Below is the listing of sizes of the main directories in the msd directory:
++---------------+---------+
+| audio/        |12.3 GB  |
+| genre/        |30.1 MB  |
+| main/         |174.4 MB |
+| tasteprofile/ |490.4 MB |
++---------------+---------+
+
+
+
+
+
+
+
+# Python and pyspark modules required
+
+import sys
+
+from pyspark import SparkContext
+from pyspark.sql import SparkSession
+from pyspark.sql.types import *
+from pyspark.sql.functions import *
+from pyspark.sql import functions as F
+
+# Required to allow the file to be submitted and run using spark-submit instead
+# of using pyspark interactively
+
+spark = SparkSession.builder.getOrCreate()
+sc = SparkContext.getOrCreate()
+
+# Compute suitable number of partitions
+
+conf = sc.getConf()
+
+N = int(conf.get("spark.executor.instances"))
+M = int(conf.get("spark.executor.cores"))
+partitions = 4 * N * M
+
+
+###### LOADING DATASETS ######
+
+#LOAD TASTE PROFILE
+
+# schema provided
+
+mismatches_schema = StructType([
+    StructField("song_id", StringType(), True),
+    StructField("song_artist", StringType(), True),
+    StructField("song_title", StringType(), True),
+    StructField("track_id", StringType(), True),
+    StructField("track_artist", StringType(), True),
+    StructField("track_title", StringType(), True)
+])
+
+# mismatches 
+
+with open("/scratch-network/courses/2019/DATA420-19S2/data/msd/tasteprofile/mismatches/sid_mismatches.txt", "r") as f:
+    lines = f.readlines()
+    sid_mismatches = []
+    for line in lines:
+        if line.startswith("ERROR: "):
+            a = line[8:26]
+            b = line[27:45]
+            c, d = line[47:-1].split("  !=  ")
+            e, f = c.split("  -  ")
+            g, h = d.split("  -  ")
+            sid_mismatches.append((a, e, f, b, g, h))
+
+mismatches = spark.createDataFrame(sc.parallelize(sid_mismatches, 64), schema=mismatches_schema)
+mismatches.cache()
+#mismatches.show(10, 40)
+
+#print(mismatches.count())
+
+# manually matched
+
+with open("/scratch-network/courses/2019/DATA420-19S2/data/msd/tasteprofile/mismatches/sid_matches_manually_accepted.txt", "r") as f:
+    lines = f.readlines()
+    sid_manmatch = []
+    for line in lines:
+        if line.startswith("< ERROR: "):
+            a = line[10:28]
+            b = line[29:47]
+            c, d = line[49:-1].split("  !=  ")
+            e, f = c.split("  -  ")
+            g, h = d.split("  -  ")
+            sid_manmatch.append((a, e, f, b, g, h))
+
+manmatch = spark.createDataFrame(sc.parallelize(sid_manmatch, 64), schema=mismatches_schema)
+manmatch.cache()
+#manmatch.show(10, 40)
+
+#print(manmatch.count())
+
+
+# triplets
+
+triplets_schema = StructType([
+    StructField("user_id", StringType(), True),
+    StructField("song_id", StringType(), True),
+    StructField("plays", IntegerType(), True)
+])
+triplets = (
+    spark.read.format("csv")
+    .option("header", "false")
+    .option("delimiter", "\t")
+    .option("codec", "gzip")
+    .schema(triplets_schema)
+    .load("hdfs:///data/msd/tasteprofile/triplets.tsv/")
+    .repartition(partitions)
+    #.cache()
+)
+#triplets.show(10, 50)
+#triplets.count()
+
+mismatches_not_accepted = mismatches.join(manmatch, on="song_id", how="left_anti")
+triplets_not_mismatched = triplets.join(mismatches_not_accepted, on="song_id", how="left_anti")
+
+#processsing q2a
+
+#print(triplets.count())
+
+# There are 48373586 rows in the triplets dataframe    
+
+#print(triplets_not_mismatched.count())
+
+# Accounting for unaccepted mismatches that needed to be taken out, the number of rows for the updated triplets dataframe is 45795111
+
+#LOAD GENRES
+
+#schema provided
+genre_schema = StructType([
+    StructField("track_id", StringType(), True),
+    StructField("genre", StringType(), True)
+])
+
+#magd
+genres_magd = (
+    spark.read.format("csv")
+    .option("header", "false")
+    .option("delimiter", "\t")
+    .option('inferschema', 'true')
+    .schema(genre_schema)
+    .load("hdfs:///data/msd/genre/msd-MAGD-genreAssignment.tsv")
+    .repartition(partitions)
+    #.cache()
+)
+#genres_magd.show(5, False)
+
+#print(genres_magd.count())
+
+
+
+#masd
+genres_masd = (
+    spark.read.format("csv")
+    .option("header", "false")
+    .option("delimiter", "\t")
+    .option('inferschema', 'true')
+    .schema(genre_schema)
+    .load("hdfs:///data/msd/genre/msd-MASD-styleAssignment.tsv")
+    .repartition(partitions)
+    #.cache()
+)
+#genres_masd.show(5, False)
+
+#print(genres_masd.count())
+
+
+
+#top magd
+genres_topmagd = (
+    spark.read.format("csv")
+    .option("header", "false")
+    .option("delimiter", "\t")
+    .option('inferschema', 'true')
+    .schema(genre_schema)
+    .load("hdfs:///data/msd/genre/msd-topMAGD-genreAssignment.tsv")
+    .repartition(partitions)
+    #.cache()
+)
+
+#genres_topmagd.show(5, False)
+
+#print(genres_topmagd.count())
+
+
+
+# LOAD MAIN
+
+# analysis
+main_analysis = (
+    spark.read.format("csv")
+    .option("header", "true")
+    .option("delimiter", ",")
+    .option('inferschema', 'true')
+    .load("hdfs:///data/msd/main/summary/analysis.csv.gz")
+    .repartition(partitions)
+)
+#main_analysis.show(5, False)
+
+#print(main_analysis.count())
+
+
+
+
+
+
+# metadata
+main_metadata = (
+    spark.read.format("csv")
+    .option("header", "true")
+    .option("delimiter", ",")
+    .option('inferschema', 'true')
+    .load("hdfs:///data/msd/main/summary/metadata.csv.gz")
+    .repartition(partitions)
+)
+#main_metadata.show(5, False)
+
+#print(main_metadata.count())
+
+
+
+#AUDIO/FEATURES
+dataset_names = [
+"msd-jmir-area-of-moments-all",
+"msd-jmir-lpc-all",
+"msd-jmir-methods-of-moments-all",
+"msd-jmir-mfcc-all",
+"msd-jmir-spectral-all-all",
+"msd-jmir-spectral-derivatives-all-all",
+"msd-marsyas-timbral",
+"msd-mvd",
+"msd-rh",
+"msd-rp",
+"msd-ssd",
+"msd-trh",
+"msd-tssd"]
+
+audio_attribute_type_mapping = {
+  "NUMERIC": DoubleType(),
+  "real": DoubleType(),
+  "string": StringType(),
+  "STRING": StringType()}
+
+def load_attributes_file_and_convert_to_schema(attribute_path, type_mapping = audio_attribute_type_mapping):
+    f = open(attribute_path, "r")
+    rows = [line.strip().split(",") for line in f.readlines()]
+    return StructType([StructField(row[0], audio_attribute_type_mapping[row[1]], True) for row in rows])  
+
+
+def load_audio_dataset(dataset):
+    attribute_path = f"/scratch-network/courses/2019/DATA420-19S2/data/msd/audio/attributes/{dataset}-v1.0.attributes.csv"
+    feature_path = f"hdfs:///data/msd/audio/features/{dataset}-v1.0.csv"
+    schema = load_attributes_file_and_convert_to_schema(attribute_path)
+    df = (
+    spark.read.format("csv")
+    .option("header", "false")
+    .option("delimiter", ",")
+    .option("codec", "gzip")
+    .schema(schema)
+    .load(feature_path)
+    .repartition(partitions)
+    #.limit(100) 
+    )
+    return df
+
+#load data and create dataframes
+audio_datasets = {}
+for dataset in dataset_names:
+    audio_datasets[dataset] = load_audio_dataset(dataset)
+audio_datasets = {dataset : load_audio_dataset(dataset) for dataset in dataset_names}
+
+#1C
+
+
+
+#count rows
+for key, value in audio_datasets.items():
+    count = audio_datasets[key].count()
+    print(key, count)
+
+
+
+# q1c - cont
+
+#print(main_metadata.select(F.col('song_id')).distinct().count())
+
+
+
+#########AUDIO SIMILARTY############
+
+#Q1 (A)
+
+from pyspark.mllib.stat import Statistics
+import pandas as pd
+from scipy import stats
+
+
+#Check for number of columns for each audio feature dataset
+#for dataset in audio_datasets:
+    #print (str(dataset) + " : " + str(len(audio_datasets[dataset].columns)))
+
+
+#for descriptives statistics
+spectral = audio_datasets["msd-jmir-spectral-all-all"]
+spectral_no_track = spectral.drop("MSD_TRACKID")
+descriptives = spectral_no_track.describe().toPandas().transpose()
+
+# -----------------------------------------------------------------------------
+# Correlation Checks
+# -----------------------------------------------------------------------------
+
+#for correlation plot
+col_names = spectral_no_track.columns
+features = spectral_no_track.rdd.map(lambda row: row[0:])
+corr_mat=Statistics.corr(features, method="pearson")
+corr_df = pd.DataFrame(corr_mat)
+corr_df.index, corr_df.columns = col_names, col_names
+
+#save to csv
+#corr_df.to_csv('correl.csv',header=True, index_label='features')
+
+
+
+
+drop_lst = ['Spectral_Rolloff_Point_Overall_Standard_Deviation_1', 'Zero_Crossings_Overall_Standard_Deviation_1', 'Root_Mean_Square_Overall_Standard_Deviation_1',
+            'Root_Mean_Square_Overall_Average_1', 'Spectral_Flux_Overall_Standard_Deviation_1', 'Zero_Crossings_Overall_Average_1', 'Spectral_Rolloff_Point_Overall_Average_1',
+            'Spectral_Flux_Overall_Average_1' 
+]
+
+spectral_nocorr = spectral.drop(*drop_lst) # for trimmed down feature set df
+spectral_no_track_nocorr =spectral_no_track.drop(*drop_lst)
+
+#for correlation plot 2
+col_names = spectral_no_track_nocorr.columns
+features = spectral_no_track_nocorr.rdd.map(lambda row: row[0:])
+corr_mat=Statistics.corr(features, method="pearson")
+corr_df = pd.DataFrame(corr_mat)
+corr_df.index, corr_df.columns = col_names, col_names
+
+
+#save to csv 2
+#corr_df.to_csv('correl.csv',header=True, index_label='features')
+
+
+
+#inspect spectral columns to get ready for preprocessing
+for feature in spectral_no_track.columns:
+    each_prev = spectral_no_track.select(str(feature)).show()
+
+#Q1 (B)
+#for histogram
+
+
+# -----------------------------------------------------------------------------
+# create binary class column
+# -----------------------------------------------------------------------------
+
+
+#classification preprocessing
+spectral = spectral.withColumn("track_id", F.substring('MSD_TRACKID',2,18))
+
+magd_spectral = (spectral
+        .join(
+        genres_magd,
+        on = "track_id",
+        how='left')
+        .drop("MSD_TRACKID")
+        )
+ 
+spectral_bin_elect = (magd_spectral
+            .withColumn("label", F.when(magd_spectral["genre"] == "Electronic", 1)
+            .otherwise(0))
+            )
+
+bin_elect_count = spectral_bin_elect.groupBy('label').agg({'label':'count'})
+
+
+# -----------------------------------------------------------------------------
+# Histogram
+# -----------------------------------------------------------------------------
+
+
+#for histogram 
+for_spectral_hist = (magd_spectral
+       .groupBy("genre")
+       .agg(F.count("track_id").alias("count"))
+       .orderBy("count", ascending=False)
+       )
+
+
+#remove rows with null or na
+dataprep = spectral_bin_elect.na.drop()
+
+#remove rows with zero values
+dataprep2 = dataprep.filter(dataprep.Spectral_Centroid_Overall_Standard_Deviation_1 != 0)
+
+dataprep2_nocorr = dataprep2.drop(*drop_lst)
+
+
+
+
+from pyspark.ml.feature import VectorAssembler
+from pyspark.sql.window import *
+
+
+def print_class_balance(data, name):
+    N = data.count()
+    counts = data.groupBy("label").count().toPandas()
+    counts["ratio"] = counts["count"] / N
+    print(name)
+    print(N)
+    print(counts)
+    print("")
+
+
+# -----------------------------------------------------------------------------
+# Vectorize 
+# -----------------------------------------------------------------------------
+
+
+nonfeatures = ['track_id', 'label', 'genre']
+
+ #change this to dataprep2_nocorr to use trimmed df
+assembler = VectorAssembler(
+    inputCols=[col for col in dataprep2.columns if col not in nonfeatures], 
+    outputCol="features"
+)
+prepped = assembler.transform(dataprep2).select(["features", "label"])  
+
+#prepped.cache()
+#prepped.count()
+
+
+
+
+from pyspark.ml.feature import StandardScaler
+scaler = StandardScaler(inputCol="features", outputCol="scaledFeatures",
+                        withStd=True, withMean=False)
+
+# Compute summary statistics by fitting the StandardScaler
+scalerModel = scaler.fit(prepped)
+
+# Normalize each feature to have unit standard deviation.
+scaledprepped = scalerModel.transform(prepped)
+#scaledprepped.show()
+
+
+
+# -----------------------------------------------------------------------------
+# Exact Stratification 
+# -----------------------------------------------------------------------------
+
+# Exact stratification using Window (multi-class variant in comments)
+
+temp = (
+    scaledprepped      # choose if scaled (scaledprepped)
+    .withColumn("id", monotonically_increasing_id())
+    .withColumn("Random", rand())
+    .withColumn(
+        "Row",
+        row_number()
+        .over(
+            Window
+            .partitionBy("label")
+            .orderBy("Random")
+        )
+    )
+)
+training = temp.where(
+    ((col("label") == 0) & (col("Row") < 379629 * 0.8)) |
+    ((col("label") == 1) & (col("Row") < 40612 * 0.8))
+)
+training.cache()
+
+test = temp.join(training, on="id", how="left_anti")
+test.cache()
+
+training = training.drop("id", "Random", "Row")
+test = test.drop("id", "Random", "Row")
+
+training = training.withColumnRenamed('Features', 'features')
+test = test.withColumnRenamed('Features', 'features')
+
+
+# print_class_balance(prepped, "features")
+#print_class_balance(training, "training")
+# print_class_balance(test, "test")
+
+
+
+# ------------------------
+# Define Weighting
+# ------------------------
+
+training_weighted = (
+    training
+    .withColumn(
+        "Weight",
+        when(col("label") == 0, 0.7)
+        .when(col("label") == 1, 3.0)
+    )
+)
+
+weights = (
+    training_weighted
+    .groupBy("label")
+    .agg(
+        collect_set(col("Weight")).alias("Weights")
+    )
+    .toPandas()
+)
+print(weights)
+
+
+# -----------------------------------------------------------------------------
+# define eval functions
+# -----------------------------------------------------------------------------
+
+
+# Define metric evaluation functions
+
+import numpy as np
+
+from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+
+# Helpers
+
+def print_binary_metrics(predictions, labelCol="label", predictionCol="prediction", rawPredictionCol="rawPrediction"):
+
+    total = predictions.count()
+    positive = predictions.filter((col(labelCol) == 1)).count()
+    negative = predictions.filter((col(labelCol) == 0)).count()
+    nP = predictions.filter((col(predictionCol) == 1)).count()
+    nN = predictions.filter((col(predictionCol) == 0)).count()
+    TP = predictions.filter((col(predictionCol) == 1) & (col(labelCol) == 1)).count()
+    FP = predictions.filter((col(predictionCol) == 1) & (col(labelCol) == 0)).count()
+    FN = predictions.filter((col(predictionCol) == 0) & (col(labelCol) == 1)).count()
+    TN = predictions.filter((col(predictionCol) == 0) & (col(labelCol) == 0)).count()
+
+    binary_evaluator = BinaryClassificationEvaluator(rawPredictionCol="rawPrediction", labelCol=labelCol, metricName="areaUnderROC")
+    auroc = binary_evaluator.evaluate(predictions)
+
+    print('actual total:    {}'.format(total))
+    print('actual positive: {}'.format(positive))
+    print('actual negative: {}'.format(negative))
+    print('nP:              {}'.format(nP))
+    print('nN:              {}'.format(nN))
+    print('TP:              {}'.format(TP))
+    print('FP:              {}'.format(FP))
+    print('FN:              {}'.format(FN))
+    print('TN:              {}'.format(TN))
+    print('precision:       {}'.format(TP / (TP + FP)))
+    print('recall:          {}'.format(TP / (TP + FN)))
+    print('accuracy:        {}'.format((TP + TN) / total))
+    print('auroc:           {}'.format(auroc))
+
+def with_custom_prediction(predictions, threshold):
+
+    def apply_custom_threshold(probability, threshold):
+        return int(probability[1] > threshold)
+
+    apply_custom_threshold_udf = udf(lambda x: apply_custom_threshold(x, threshold), IntegerType())
+
+    return predictions.withColumn("customPrediction", apply_custom_threshold_udf(col("probability")))
+
+# ------------------------
+# Binary Models
+# ------------------------
+
+#train vanilla Logisitic Regression
+
+
+from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+
+lr = LogisticRegression(featuresCol='features', labelCol='label')
+lr_model = lr.fit(training)
+predictions_lr = lr_model.transform(test)
+
+print_binary_metrics(predictions_lr)
+
+
+
+#train weighted Logisitic Regression
+
+lr = LogisticRegression(featuresCol='features', labelCol='label', weightCol="Weight", maxIter=200, regParam=0.0, elasticNetParam=0.0, aggregationDepth=5)
+lrw_model = lr.fit(training_weighted)
+predictions_weight_lr = lrw_model.transform(test)
+
+print_binary_metrics(predictions_weight_lr)
+
+# ------------------------
+# LR Hyper Paramater Tuning
+# ------------------------
+
+from pyspark.ml.tuning import ParamGridBuilder, CrossValidator
+paramGrid = ParamGridBuilder()\
+    .addGrid(lr.regParam,[0.01, 0.1, 1.0])\
+    .addGrid(lr.elasticNetParam,[0.0, 0.5, 1.0])\
+    .addGrid(lr.aggregationDepth,[2,5,10])\
+    .addGrid(lr.maxIter,[50, 100, 200])\
+    .build()
+   
+
+# CV to facilitate hyp tuning
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+binary_evaluator = BinaryClassificationEvaluator(metricName="areaUnderROC")
+cv = CrossValidator(estimator=lr, estimatorParamMaps=paramGrid, evaluator=binary_evaluator, numFolds=5)
+# Run cross validations
+cvlr_Model = cv.fit(training_weighted)
+# this will likely take a fair amount of time because of the amount of models that we're creating and testing
+
+
+predictions_hyp_lr = cvlr_Model.transform(test)
+
+print_binary_metrics(predictions_hyp_lr)
+
+
+
+
+# get best params
+print(cvlr_Model.getEstimatorParamMaps()[np.argmax(cvlr_Model.avgMetrics)])
+
+
+# ------------------------
+# Naive Bayes Vanilla
+# ------------------------
+
+from pyspark.ml.classification import NaiveBayes
+
+nb = NaiveBayes(smoothing=1.0, modelType="multinomial")
+
+nb_model = nb.fit(training)
+predictions_nb = nb_model.transform(test)
+predictions_nb.cache()
+print_binary_metrics(predictions_nb)
+
+
+
+# ------------------------
+# Naive Bayes Weighted
+# ------------------------
+
+from pyspark.ml.classification import NaiveBayes
+
+nb = NaiveBayes(smoothing=1.0, modelType="multinomial", weightCol="Weight")
+
+nbw_model = nb.fit(training_weighted)
+predictions_nbw = nbw_model.transform(test)
+predictions_nbw.cache()
+print_binary_metrics(predictions_nbw)
+
+
+
+
+# ------------------------
+# Random Forest
+# ------------------------
+
+
+#balancing
+
+#separate classes
+training1 = training.where(F.col('label')==1)
+training0 = training.where(F.col('label')==0)
+
+#downsample majority 70%
+bigger_split, smaller_split= training0.randomSplit([0.70, 0.30], seed=456)
+training_bin_bal = training1.union(bigger_split)
+
+#upsample minority 200%
+training_bin_bal = training_bin_bal.union(training1).union(training1)
+
+
+
+
+print_class_balance(training_bin_bal, "training_bin_bal")
+
+
+from pyspark.ml.feature import StringIndexer, VectorIndexer, IndexToString
+from pyspark.ml.classification import RandomForestClassifier
+from pyspark.ml.tuning import ParamGridBuilder, CrossValidator
+
+
+
+#fit unbalanced RF
+
+rf = RandomForestClassifier(labelCol="label", featuresCol="features")
+
+rf_model = rf.fit(training)
+predictions_rf = rf_model.transform(test)
+print_binary_metrics(predictions_rf)
+
+
+#fit balanced RF
+
+rf = RandomForestClassifier(labelCol="label", featuresCol="features")
+
+
+rf_model = rf.fit(training_bin_bal)
+predictions_rfbal = rf_model.transform(test)
+print_binary_metrics(predictions_rfbal)
+
+# ------------------------
+# Random Forest CV
+# ------------------------
+
+
+paramGrid = ParamGridBuilder() \
+    .addGrid(rf.numTrees, [50, 100, 500]) \
+    .addGrid(rf.featureSubsetStrategy ,['all','onethird']) \
+    .addGrid(rf.maxDepth,[2,3,4]) \
+    .build()
+
+cvrf = CrossValidator(estimator=rf,
+                          estimatorParamMaps=paramGrid,
+                          evaluator=BinaryClassificationEvaluator(),
+                          numFolds=5)
+
+cvrfModel = cvrf.fit(training_bin_bal)
+
+predictions_rf = cvrfModel.transform(test)
+print_binary_metrics(predictions_rf)
+
+
+
+
+# ------------------------------
+# Multiclass Logistic Regression
+# ------------------------------
+
+
+from pyspark.ml.feature import StringIndexer, VectorIndexer, IndexToString
+#remove rows with null or na
+dataprep_multi = magd_spectral.na.drop()
+#remove rows with zero values
+dataprep_multi = dataprep.filter(dataprep.Spectral_Centroid_Overall_Standard_Deviation_1 != 0)
+
+dataprep_multi = dataprep.filter(dataprep.Spectral_Centroid_Overall_Standard_Deviation_1 != 0)
+
+
+# ------------------------------
+# Add genre labels
+# ------------------------------
+
+
+#add index for classes
+indexer = StringIndexer(inputCol="genre", outputCol="genre_id")
+dataprep_multi = indexer.fit(dataprep_multi).transform(dataprep_multi)
+
+tempview = dataprep_multi.select(F.col('genre'), F.col('genre_id'), F.col('Compactness_Overall_Average_1'))
+
+
+def dbl2int(x):
+    return int(x)
+
+udf_to_int = udf(dbl2int, IntegerType())
+dataprep_multi2 = dataprep_multi.withColumn("genre_int", udf_to_int("genre_id")).drop("genre_id")
+
+dataprep_multi2_nocorr = dataprep_multi2.drop(*drop_lst)
+
+nonfeatures = ['track_id', 'genre', 'genre_int']
+
+ #change this to dataprep2_nocorr to use trimmed df
+assembler = VectorAssembler(
+    inputCols=[col for col in dataprep_multi2.columns if col not in nonfeatures], 
+    outputCol="features"
+)
+multprepped = assembler.transform(dataprep_multi2).select(["features", "genre_int"])  
+
+multprepped = multprepped.withColumnRenamed('genre_int', 'label')
+
+
+# ------------------------------
+# Multiclass Sampling
+# ------------------------------
+
+
+temp = (
+    multprepped
+    .withColumn("id", monotonically_increasing_id())
+    .withColumn("Random", rand())
+    .withColumn(
+        "Row",
+        row_number()
+        .over(
+            Window
+            .partitionBy("label")
+            .orderBy("Random")
+        )
+    )
+)
+
+class_counts = (
+    multprepped
+    .groupBy("label")
+    .count()
+    .toPandas()
+    .set_index("label")["count"]
+    .to_dict()
+)
+classes = sorted(class_counts.keys())
+
+training = temp
+for c in classes:
+    training = training.where((col("label") != c) | (col("Row") < class_counts[c] * 0.8))
+
+
+test = temp.join(training, on="id", how="left_anti")
+
+training = training.drop("id", "Random", "Row")
+test = test.drop("id", "Random", "Row")
+
+print_class_balance(multprepped, "features")
+print_class_balance(training, "training")
+print_class_balance(test, "test")
+
+
+
+training.cache()
+
+
+# ------------------------------
+# Multiclass resampling
+# ------------------------------
+
+
+#separate classes to upsample
+training20 = training.where(F.col('label')==20)
+training19 = training.where(F.col('label')==19)
+training18 = training.where(F.col('label')==18)
+training17 = training.where(F.col('label')==17)
+training16 = training.where(F.col('label')==16)
+training15 = training.where(F.col('label')==15)
+training14 = training.where(F.col('label')==14)
+
+#upsample class 20 times 9, class 19 times 6, class 18 times 4, classes 17, 16, 15 and 14 times 2
+training_multupsampled = training \
+                    .union(training20) \
+                    .union(training20) \
+                    .union(training20) \
+                    .union(training20) \
+                    .union(training20) \
+                    .union(training20) \
+                    .union(training20) \
+                    .union(training20) \
+                    .union(training19) \
+                    .union(training19) \
+                    .union(training19) \
+                    .union(training19) \
+                    .union(training19) \
+                    .union(training18) \
+                    .union(training18) \
+                    .union(training18) \
+                    .union(training17) \
+                    .union(training16) \
+                    .union(training15) \
+                    .union(training14) 
+
+
+#print_class_balance(training_multupsampled, "training_multupsampled")
+
+
+training_multdownupsampled = (
+    training_multupsampled
+    .withColumn("Random", rand())
+    .where((col("label") != 0) | ((col("label") == 0) & (col("Random") < 75 * (159/ 303703))))
+    .where((col("label") != 1) | ((col("label") == 1) & (col("Random") < 250 * (159/ 303703))))
+    .where((col("label") != 2) | ((col("label") == 2) & (col("Random") < 350 * (159/ 303703))))
+    .where((col("label") != 3) | ((col("label") == 3) & (col("Random") < 350 * (159/ 303703))))
+    .where((col("label") != 4) | ((col("label") == 4) & (col("Random") < 350 * (159/ 303703))))
+    .where((col("label") != 5) | ((col("label") == 5) & (col("Random") < 350 * (159/ 303703))))
+    .where((col("label") != 6) | ((col("label") == 6) & (col("Random") < 350 * (159/ 303703))))
+    .where((col("label") != 7) | ((col("label") == 7) & (col("Random") < 400 * (159/ 303703))))
+    .where((col("label") != 8) | ((col("label") == 8) & (col("Random") < 550 * (159/ 303703))))
+    .where((col("label") != 9) | ((col("label") == 9) & (col("Random") <  550* (159/ 303703))))
+    .where((col("label") != 10) | ((col("label") == 10) & (col("Random") < 600 * (159/ 303703))))
+    .where((col("label") != 11) | ((col("label") == 11) & (col("Random") < 600 * (159/ 303703))))
+    .where((col("label") != 12) | ((col("label") == 12) & (col("Random") < 600 * (159/ 303703))))
+
+
+
+   
+)
+
+print_class_balance(training_multdownupsampled, "training_multdownupsampled")
+
+
+training_multdownupsampled = training_multdownupsampled.select(F.col('features'), F.col('label'))
+
+
+# ------------------------------
+# Multiclass Logistic Regression Modelling
+# ------------------------------
+
+lr = LogisticRegression(featuresCol='features', labelCol='label', maxIter=200, regParam=0.00, elasticNetParam=0.0, family="multinomial", aggregationDepth=2)
+lr_model = lr.fit(training_multdownupsampled)
+predictions_mult = lr_model.transform(test)
+predictions_mult.cache()
+
+
+predictions_mult.groupby("prediction").agg({"prediction" : "count"}).show()
+
+
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+def print_multi_metrics(predictions, labelCol="label", predictionCol="prediction", rawPredictionCol="rawPrediction"):
+
+
+
+    for i in range(0,21):
+
+        print(f"******CLASS {i} METRICS******")
+        print()
+
+        total = predictions_mult.count()
+        positive = predictions_mult.filter((F.col(labelCol) == i)).count()
+        negative = predictions_mult.filter((F.col(labelCol) != i)).count()
+        nP = predictions_mult.filter((F.col(predictionCol) == i)).count()
+        nN = predictions_mult.filter((F.col(predictionCol) != i)).count()
+        TP = predictions.filter((col(predictionCol) == i) & (col(labelCol) == i)).count()
+        FP = predictions.filter((col(predictionCol) == i) & (col(labelCol) != i)).count()
+        FN = predictions.filter((col(predictionCol) != i) & (col(labelCol) == i)).count()
+        TN = predictions.filter((col(predictionCol) != i) & (col(labelCol) != i)).count()
+
+
+        print('actual total:    {}'.format(total))
+        print('actual positive: {}'.format(positive))
+        print('actual negative: {}'.format(negative))
+        print('nP:              {}'.format(nP))
+        print('nN:              {}'.format(nN))
+        print('TP:              {}'.format(TP))
+        print('FP:              {}'.format(FP))
+        print('FN:              {}'.format(FN))
+        print('TN:              {}'.format(TN))
+        if (FP == 0) & (TP == 0):
+            print('precision: NA')
+            print('recall:          {}'.format(TP / (TP + FN)))
+            print('accuracy:        {}'.format((TP + TN) / total))
+        else:
+            print('precision:       {}'.format(TP / (TP + FP)))       
+            print('recall:          {}'.format(TP / (TP + FN)))
+            print('accuracy:        {}'.format((TP + TN) / total))
+        print()
+
+
+
+
+print_multi_metrics(predictions_mult)
+
+# ------------------------------
+# Song Recommendations
+# ------------------------------
+
+#1a
+
+
+songcounts = triplets_not_mismatched.groupby('song_id').agg({'song_id': 'count'})
+#songcounts.show()
+
+#378310
+
+usercounts = triplets_not_mismatched.groupby('user_id').agg({'user_id':'count'})
+#usercounts.show()
+
+#1019318 
+
+
+mostplays = triplets_not_mismatched.groupby("user_id").agg({"plays":"sum"})
+#mostplays.orderBy(F.desc('sum(plays)')).show(1, False)
+
+
+
+# +----------------------------------------+----------+                           
+# |user_id                                 |sum(plays)|
+# +----------------------------------------+----------+
+# |093cb74eb3c517c5179ae24caf0ebec51b24d2a2|13074     |
+# +----------------------------------------+----------+
+
+
+
+mostplays_uniquesongs = triplets_not_mismatched.where(triplets_not_mismatched['user_id'] == "093cb74eb3c517c5179ae24caf0ebec51b24d2a2").count()
+#195
+
+#(195/378310) *100
+#0.05154502920884989
+
+
+# ------------------------------
+# Popularity and User Activity Plots
+# ------------------------------
+
+
+
+
+popularity = triplets_not_mismatched.groupby("song_id").agg({"user_id":"count"})
+popularity = popularity.withColumnRenamed('count(user_id)', 'user_plays').orderBy('user_plays', ascending=False)
+
+
+user_activity = triplets_not_mismatched.groupby("user_id").agg({"song_id":"count"})
+user_activity = user_activity.withColumnRenamed('count(song_id)', 'song_plays').orderBy('song_plays', ascending=False)
+
+#saving for distribution plotting
+#popularity.coalesce(1).write.format('com.databricks.spark.csv').save('/user/nar78/popularity', header='true')
+#user_activity.coalesce(1).write.format('com.databricks.spark.csv').save('/user/nar78/user_activity', header='true')
+
+
+# ------------------------------
+# ALS pre processing
+# ------------------------------
+
+
+user_counts = (
+    triplets_not_mismatched
+    .groupBy("user_id")
+    .agg(
+        F.count(col("song_id")).alias("song_count"),
+        F.sum(col("plays")).alias("play_count"),
+    )
+    .orderBy(col("play_count").desc())
+)
+
+user_counts.cache()
+
+statistics = (
+    user_counts
+    .select("song_count", "play_count")
+    .describe()
+    .toPandas()
+    .set_index("summary")
+    .rename_axis(None)
+    .T
+)
+print(statistics)
+
+
+song_counts = (
+    triplets_not_mismatched
+    .groupBy("song_id")
+    .agg(
+        F.count(col("user_id")).alias("user_count"),
+        F.sum(col("plays")).alias("play_count"),
+    )
+    .orderBy(col("play_count").desc())
+)
+
+song_counts.cache()
+
+
+
+triplets_limited = triplets_not_mismatched
+
+
+statistics = (
+    song_counts
+    .select("user_count", "play_count")
+    .describe()
+    .toPandas()
+    .set_index("summary")
+    .rename_axis(None)
+    .T
+)
+print(statistics)
+
+
+# ------------------------------
+# Cleaning ALS data with filters for minimums
+# ------------------------------
+
+
+# 2 iterations of inner joins to cut off values below threshold. Keep running and checking if they satisfy pre-set thresholds
+
+triplets_limited = triplets_not_mismatched
+triplets_limited.cache()
+
+
+user_song_count_threshold = 10 #thresholds here
+song_user_count_threshold = 5 
+
+
+triplets_limited = (
+    triplets_limited
+    .join(
+        triplets_limited.groupBy("user_id").count().where(col("count") > user_song_count_threshold).select("user_id"),
+        on="user_id",
+        how="inner"
+    )
+)
+
+triplets_limited = (
+    triplets_limited
+    .join(
+        triplets_limited.groupBy("song_id").count().where(col("count") > song_user_count_threshold).select("song_id"),
+        on="song_id",
+        how="inner"
+    )
+)
+
+
+
+
+triplets_limited = (
+    triplets_limited
+    .join(
+        triplets_limited.groupBy("user_id").count().where(col("count") > user_song_count_threshold).select("user_id"),
+        on="user_id",
+        how="inner"
+    )
+)
+
+triplets_limited = (
+    triplets_limited
+    .join(
+        triplets_limited.groupBy("song_id").count().where(col("count") > song_user_count_threshold).select("song_id"),
+        on="song_id",
+        how="inner"
+    )
+)
+
+triplets_limited.cache()
+
+
+(
+    triplets_limited
+    .agg(
+        countDistinct(col("user_id")).alias('user_count'),
+        countDistinct(col("song_id")).alias('song_count')
+    )
+    .toPandas()
+    .T
+    .rename(columns={0: "value"})
+)
+
+
+
+def get_user_counts(triplets):
+    return (
+        triplets
+        .groupBy("user_id")
+        .agg(
+            F.count(col("song_id")).alias("song_count"),
+            F.sum(col("plays")).alias("play_count"),
+        )
+        .orderBy(col("play_count").desc())
+    )
+
+def get_song_counts(triplets):
+    return (
+        triplets
+        .groupBy("song_id")
+        .agg(
+            F.count(col("user_id")).alias("user_count"),
+            F.sum(col("plays")).alias("play_count"),
+        )
+        .orderBy(col("play_count").desc())
+    )
+
+
+#check if it satisfies thresholds
+print(get_user_counts(triplets_not_mismatched).approxQuantile("song_count", [0.0, 0.25, 0.5, 0.75, 1.0], 0.05))
+print(get_song_counts(triplets_not_mismatched).approxQuantile("user_count", [0.0, 0.25, 0.5, 0.75, 1.0], 0.05))
+
+
+print("quantiles of songcounts of users (user activity): " + str(get_user_counts(triplets_not_mismatched).approxQuantile("song_count", [0.0, 0.25, 0.5, 0.75, 1.0], 0.05)))
+print("quantiles of usercounts of songs (song popularity): " + str(get_song_counts(triplets_not_mismatched).approxQuantile("user_count", [0.0, 0.25, 0.5, 0.75, 1.0], 0.05)))
+
+
+print("quantiles for limited user songcounts : " + str(get_user_counts(triplets_limited).approxQuantile("song_count", [0.0, 0.25, 0.5, 0.75, 1.0], 0.05)))
+print("quantiles for limited song usercounts: "+ str(get_song_counts(triplets_limited).approxQuantile("user_count", [0.0, 0.25, 0.5, 0.75, 1.0], 0.05)))
+
+#determine loss of data
+triplets_limited.count()
+triplets_limited.groupby('song_id').agg({'song_id': 'count'}).count()
+triplets_limited.groupby('user_id').agg({'user_id':'count'}).count()
+
+
+# ------------------------------
+# Index user and song ids
+# ------------------------------
+
+
+
+from pyspark.ml.feature import StringIndexer
+user_id_indexer = StringIndexer(inputCol="user_id", outputCol="user_id_encoded")
+song_id_indexer = StringIndexer(inputCol="song_id", outputCol="song_id_encoded")
+
+user_id_indexer_model = user_id_indexer.fit(triplets_limited)
+song_id_indexer_model = song_id_indexer.fit(triplets_limited)
+
+triplets_limited = user_id_indexer_model.transform(triplets_limited)
+triplets_limited = song_id_indexer_model.transform(triplets_limited)
+
+
+# ------------------------------
+# Test train split
+# ------------------------------
+
+
+# Splits
+
+training, test = triplets_limited.randomSplit([0.75, 0.25])
+
+test_not_training = test.join(training, on="user_id", how="left_anti")
+
+training.cache()
+test.cache()
+test_not_training.cache()
+
+
+#check if anything in test is not in train
+print(f"training:          {training.count()}")
+print(f"test:              {test.count()}")
+print(f"test_not_training: {test_not_training.count()}")
+
+#none
+# training:          31282345                                                     
+# test:              13415457                                                     
+# test_not_training: 0  
+
+
+
+# ------------------------------
+# ALS modelling
+# ------------------------------
+
+# Imports
+
+from pyspark.ml.recommendation import ALS
+from pyspark.ml.evaluation import RegressionEvaluator
+from pyspark.ml.feature import StringIndexer
+
+from pyspark.mllib.evaluation import RankingMetrics
+
+# Modeling
+
+als = ALS(maxIter=5, regParam=0.01, userCol="user_id_encoded", itemCol="song_id_encoded", ratingCol="plays", coldStartStrategy="drop", implicitPrefs=True, nonnegative =True)
+als_model = als.fit(training)
+predictionsALS = als_model.transform(test)
+predictionsALS = predictionsALS.orderBy(col("user_id"), col("song_id"), col("prediction").desc())
+
+predictionsALS.show(10, False)
+
+
+#metrics
+# Helpers 
+def extract_songs_top_k(x, k):
+    x = sorted(x, key=lambda x: -x[1])
+    return [x[0] for x in x][0:k]
+
+extract_songs_top_k_udf = udf(lambda x: extract_songs_top_k(x, k), ArrayType(IntegerType()))
+
+def extract_songs(x):
+    x = sorted(x, key=lambda x: -x[1])
+    return [x[0] for x in x]
+
+extract_songs_udf = udf(lambda x: extract_songs(x), ArrayType(IntegerType()))
+
+
+# ------------------------------
+# Song Recommendations Output
+# ------------------------------
+
+#recommendations
+k = 5
+
+topK = als_model.recommendForAllUsers(k)
+
+topK.cache()
+topK.count()
+
+# 932143
+
+topK.show(10, False)
+
+
+
+
+recommended_songs = (
+    topK
+    .withColumn("recommended_songs", extract_songs_top_k_udf(col("recommendations")))
+    .select("user_id_encoded", "recommended_songs")
+)
+recommended_songs.cache()
+recommended_songs.count()
+
+# 932143
+
+recommended_songs.show(10, False)
+
+
+
+
+
+relevant_songs = (
+    test
+    .select(
+        col("user_id_encoded").cast(IntegerType()),
+        col("song_id_encoded").cast(IntegerType()),
+        col("plays").cast(IntegerType())
+    )
+    .groupBy('user_id_encoded')
+    .agg(
+        collect_list(
+            array(
+                col("song_id_encoded"),
+                col("plays")
+            )
+        ).alias('relevance')
+    )
+    .withColumn("relevant_songs", extract_songs_udf(F.col("relevance")))
+    .select("user_id_encoded", "relevant_songs")
+)
+relevant_songs.cache()
+#relevant_songs.count()
+
+
+relevant_songs.show(10)
+
+
+#create matched recos and relevant
+
+combined = (
+    recommended_songs.join(relevant_songs, on='user_id_encoded', how='inner')
+    .rdd
+    .map(lambda row: (row[1], row[2]))
+)
+combined.cache()
+combined.count()
+
+
+combined.take(1)
+
+# ------------------------------
+# Reco Metrics
+# ------------------------------
+
+
+rankingMetrics = RankingMetrics(combined)
+ndcgAtK = rankingMetrics.ndcgAt(k)
+print(ndcgAtK)
+
+
+
+rankingMetrics.precisionAt(5)
+
+
+rankingMetrics.ndcgAt(10)
+
+
+rankingMetrics.meanAveragePrecision
+
+
+
+
+
